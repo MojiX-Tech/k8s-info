@@ -1,0 +1,1362 @@
+#!/usr/bin/env bash
+
+# ======================================================================
+# k8s-info - Kubernetes Cluster Status Report
+#
+# One file, two jobs:
+#   k8s-info setup      looks at the cluster (read only), asks a few
+#                       questions and writes a configuration
+#   k8s-info [environment] [section]  prints the report of that cluster
+#
+# Needs: bash 3.2 or newer, kubectl (or oc / microk8s / k3s).
+# Optional: openssl (expiry dates of TLS certificates), etcdctl.
+# The report only reads from the cluster. It never changes anything.
+#
+# https://github.com/MojiX-Tech/k8s-info
+# Copyright 2026 MojiX-Tech - Apache License 2.0 (see LICENSE)
+# ======================================================================
+
+VERSION="1.0.0"
+PROG=$(basename "$0")
+
+# Sections that are built in. Every other section is a namespace.
+BUILTIN_SECTIONS="nodes services configmaps secrets longhorn storage ingress certificates system etcd health"
+RESERVED_WORDS="$BUILTIN_SECTIONS setup list config help all service configmap secret cert-manager"
+
+# ----------------------------------------------------------------------
+# Command line
+# ----------------------------------------------------------------------
+PROFILE=""
+OPT_KUBECONFIG=""
+CONFIG_FILE=""
+OPT_CONTEXT=""
+COLOR_MODE="auto"
+ASSUME_YES="no"
+MODE="report"
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -e|--env|-p|--profile) PROFILE="$2"; shift ;;
+        --kubeconfig)  OPT_KUBECONFIG="$2"; shift ;;
+        -c|--config)   CONFIG_FILE="$2"; shift ;;
+        --context)     OPT_CONTEXT="$2"; shift ;;
+        --no-color)    COLOR_MODE="never" ;;
+        --color)       COLOR_MODE="always" ;;
+        -y|--yes)      ASSUME_YES="yes" ;;
+        -h|--help|help|list) MODE="help" ;;
+        -V|--version)  echo "$PROG $VERSION"; exit 0 ;;
+        setup)         MODE="setup" ;;
+        config)        MODE="config" ;;
+        -*)            echo "$PROG: unknown option $1 (see $PROG --help)" >&2; exit 2 ;;
+        *)             POSITIONAL+=("$1") ;;
+    esac
+    shift
+done
+
+# ----------------------------------------------------------------------
+# Colours and layout
+# ----------------------------------------------------------------------
+if [ "$COLOR_MODE" = "always" ] || { [ "$COLOR_MODE" = "auto" ] && [ -t 1 ] && [ -z "$NO_COLOR" ]; }; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; BLUE=$'\033[0;34m'; YELLOW=$'\033[1;33m'
+    CYAN=$'\033[0;36m'; NC=$'\033[0m'; BOLD=$'\033[1m'
+else
+    RED=""; GREEN=""; BLUE=""; YELLOW=""; CYAN=""; NC=""; BOLD=""
+fi
+
+# line <char> <count>
+line() {
+    local out="" n=$2
+    while [ "$n" -gt 0 ]; do out+="$1"; n=$((n - 1)); done
+    printf '%s' "$out"
+}
+
+# box <title> <second line> - the second line is centred under the title
+box() {
+    local title="$1" sub="$2" width pad
+    width=$((${#title} + 2))
+    [ $((${#sub} + 2)) -gt "$width" ] && width=$((${#sub} + 2))
+    pad=$(((width - ${#sub}) / 2))
+    printf '%s╔%s╗%s\n' "$BLUE" "$(line '═' "$width")" "$NC"
+    printf '%s║%s %s%s%s%s%s║%s\n' "$BLUE" "$NC" "$BOLD" "$title" "$NC" "$(line ' ' $((width - ${#title} - 1)))" "$BLUE" "$NC"
+    printf '%s║%s%s%s%s%s║%s\n' "$BLUE" "$NC" "$(line ' ' "$pad")" "$sub" "$(line ' ' $((width - ${#sub} - pad)))" "$BLUE" "$NC"
+    printf '%s╚%s╝%s\n' "$BLUE" "$(line '═' "$width")" "$NC"
+}
+
+SEC_NO=0
+SUB_NO=0
+
+# section_header <text> - SEC_NO is set by the caller (position in the configuration)
+section_header() {
+    local text="$SEC_NO. $1"
+    SUB_NO=0
+    printf '\n%s%s%s%s\n' "$YELLOW" "$BOLD" "$text" "$NC"
+    printf '%s%s%s\n\n' "$CYAN" "$(line '═' ${#text})" "$NC"
+}
+
+# sub <text> - numbered sub heading, a blank line before every one but the first
+sub() {
+    [ "$SUB_NO" -gt 0 ] && echo
+    SUB_NO=$((SUB_NO + 1))
+    local text="$SEC_NO.$SUB_NO $1"
+    printf '%s%s%s\n' "$GREEN" "$text" "$NC"
+    printf '%s%s%s\n' "$CYAN" "$(line '-' ${#text})" "$NC"
+}
+
+die() { printf '%s%s: %s%s\n' "$RED" "$PROG" "$*" "$NC" >&2; exit 1; }
+
+in_list() { # in_list <word> <list...>
+    local w="$1" x; shift
+    for x in "$@"; do [ "$x" = "$w" ] && return 0; done
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# kubectl
+# ----------------------------------------------------------------------
+KI_KUBECTL="kubectl"
+KI_KUBECONFIG=""
+KI_CONTEXT=""
+
+k() {
+    $KI_KUBECTL ${KI_KUBECONFIG:+--kubeconfig "$KI_KUBECONFIG"} ${KI_CONTEXT:+--context "$KI_CONTEXT"} "$@"
+}
+
+# first line stays on top, the rest is sorted in natural order (worker2 before worker10)
+sorted() {
+    local out
+    out=$("$@" 2>&1) || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out" | head -n 1
+    printf '%s\n' "$out" | tail -n +2 | sort -V
+}
+
+# drop the lines that match the extended regular expression (empty = keep all)
+without() {
+    if [ -n "$1" ]; then grep -Ev -- "$1"; else cat; fi
+}
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+user_config_dir() {
+    if [ -n "$K8S_INFO_CONFIG_DIR" ]; then echo "$K8S_INFO_CONFIG_DIR"
+    elif [ "$(id -u)" = "0" ]; then echo "/etc/k8s-info"
+    else echo "${XDG_CONFIG_HOME:-$HOME/.config}/k8s-info"
+    fi
+}
+
+find_config() {
+    local f
+    if [ -n "$CONFIG_FILE" ]; then echo "$CONFIG_FILE"; return; fi
+    for f in "$(user_config_dir)/$PROFILE.conf" "/etc/k8s-info/$PROFILE.conf"; do
+        [ -r "$f" ] && { echo "$f"; return; }
+    done
+    echo "$(user_config_dir)/$PROFILE.conf"
+}
+
+config_defaults() {
+    KI_TITLE="Kubernetes Cluster Status Report"
+    KI_METRICS="yes"
+    KI_SECTIONS=()
+    KI_APP_KEY=(); KI_APP_NS=(); KI_APP_TITLE=(); KI_APP_RESOURCES=(); KI_APP_CONTAINERS=(); KI_APP_EXCLUDE=()
+    KI_LONGHORN_NS="longhorn-system"
+    KI_INGRESS_NS=""
+    KI_GATEWAY_API="no"
+    KI_CERT_MANAGER_NS=""
+    KI_TLS_EXPIRY="no"
+    KI_ETCD_MODE="exec"
+    KI_ETCD_NS="kube-system"
+    KI_ETCD_SELECTOR="component=etcd"
+    KI_ETCD_CACERT="/etc/kubernetes/pki/etcd/ca.crt"
+    KI_ETCD_CERT="/etc/kubernetes/pki/etcd/server.crt"
+    KI_ETCD_KEY="/etc/kubernetes/pki/etcd/server.key"
+}
+
+app_index() { # app_index <key> -> index in the KI_APP_* lists
+    local i=0
+    while [ "$i" -lt "${#KI_APP_KEY[@]}" ]; do
+        [ "${KI_APP_KEY[$i]}" = "$1" ] && { echo "$i"; return 0; }
+        i=$((i + 1))
+    done
+    return 1
+}
+
+section_description() {
+    local i
+    case "$1" in
+        nodes)        echo "Node status, resource consumption and capacity" ;;
+        services)     echo "Services of all namespaces" ;;
+        configmaps)   echo "ConfigMaps of the configured namespaces" ;;
+        secrets)      echo "Names and types of the Secrets in the configured namespaces (never their values)" ;;
+        longhorn)     echo "Longhorn storage nodes, volumes, replicas, backups, snapshots and recurring jobs in the namespace $KI_LONGHORN_NS" ;;
+        storage)      echo "CSI drivers, storage classes, persistent volumes and claims, volume attachments" ;;
+        ingress)      echo "Ingress classes, the ingress controller${KI_INGRESS_NS:+ in the namespace $KI_INGRESS_NS} and the Ingress rules of all namespaces" ;;
+        certificates) echo "cert-manager, issuers, certificates and the expiry dates of the TLS certificates" ;;
+        system)       echo "Cluster version, API server health, namespaces and the kube-system pods" ;;
+        etcd)         echo "etcd member list, endpoint status and health, active leader" ;;
+        health)       echo "Pods that are not ready, restarts, incomplete workloads and warning events" ;;
+        app:*)
+            i=$(app_index "${1#app:}") || return
+            echo "Resources, containers and resource consumption in the namespace ${KI_APP_NS[$i]}" ;;
+    esac
+}
+
+# ----------------------------------------------------------------------
+# Report sections
+# ----------------------------------------------------------------------
+nodes_section() {
+    section_header "Kubernetes Nodes Information"
+    sub "Nodes Status"
+    sorted k get nodes
+    if [ "$KI_METRICS" = "yes" ]; then
+        sub "Nodes Resource Consumption"
+        sorted k top nodes
+    fi
+    sub "Nodes Capacity"
+    sorted k get nodes -o custom-columns='NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory,PODS:.status.capacity.pods,ARCH:.status.nodeInfo.architecture,OS:.status.nodeInfo.osImage,KERNEL:.status.nodeInfo.kernelVersion,RUNTIME:.status.nodeInfo.containerRuntimeVersion'
+}
+
+app_section() { # app_section <index>
+    local i=$1 ns title res exclude
+    ns=${KI_APP_NS[$i]}; title=${KI_APP_TITLE[$i]}; res=${KI_APP_RESOURCES[$i]:-all}; exclude=${KI_APP_EXCLUDE[$i]}
+    section_header "Kubernetes $title Information"
+    sub "Namespace Resources"
+    k -n "$ns" get "$res" -o wide | without "$exclude"
+    if [ "${KI_APP_CONTAINERS[$i]}" = "yes" ]; then
+        sub "Containers"
+        k -n "$ns" get pods -o custom-columns='POD:.metadata.name,CONTAINERS:.spec.containers[*].name' | without "$exclude"
+    fi
+    if [ "$KI_METRICS" = "yes" ]; then
+        sub "PODs Resource Consumption"
+        k -n "$ns" top pods | without "$exclude"
+    fi
+}
+
+services_section() {
+    section_header "Kubernetes Service Information"
+    sub "Services of All Namespaces"
+    k get services --all-namespaces -o wide
+}
+
+configmaps_section() {
+    local i=0
+    section_header "Kubernetes ConfigMap Information"
+    while [ "$i" -lt "${#KI_APP_NS[@]}" ]; do
+        sub "${KI_APP_TITLE[$i]} ConfigMaps"
+        k -n "${KI_APP_NS[$i]}" get configmaps
+        i=$((i + 1))
+    done
+}
+
+secrets_section() {
+    local i=0
+    section_header "Kubernetes Secret Information"
+    while [ "$i" -lt "${#KI_APP_NS[@]}" ]; do
+        sub "${KI_APP_TITLE[$i]} Secrets"
+        k -n "${KI_APP_NS[$i]}" get secrets
+        i=$((i + 1))
+    done
+}
+
+longhorn_section() {
+    local ns=$KI_LONGHORN_NS
+    section_header "Kubernetes Longhorn Storage Information"
+    sub "Longhorn Nodes";            k -n "$ns" get nodes.longhorn.io
+    sub "Longhorn Volumes";          k -n "$ns" get volumes.longhorn.io
+    sub "Longhorn Volumes and Their Claims"
+    k -n "$ns" get volumes.longhorn.io -o custom-columns='VOLUME:.metadata.name,ACCESS:.spec.accessMode,STATE:.status.state,NODE:.status.currentNodeID,NAMESPACE:.status.kubernetesStatus.namespace,PVC:.status.kubernetesStatus.pvcName'
+    sub "Longhorn Replicas";         k -n "$ns" get replicas.longhorn.io
+    sub "Longhorn Engine Image";     k -n "$ns" get engineimages.longhorn.io
+    sub "Longhorn DaemonSets";       k -n "$ns" get daemonsets -o wide
+    sub "Longhorn Deployments";      k -n "$ns" get deployments -o wide
+    sub "Longhorn Services";         k -n "$ns" get services -o wide
+    sub "Longhorn Backup Target";    k -n "$ns" get backuptargets.longhorn.io
+    sub "Longhorn Backup Volumes";   k -n "$ns" get backupvolumes.longhorn.io
+    sub "Longhorn Recurring Jobs";   k -n "$ns" get recurringjobs.longhorn.io
+    sub "Longhorn Cron Jobs";        k -n "$ns" get cronjobs.batch -o wide
+    sub "Longhorn Jobs";             k -n "$ns" get jobs.batch
+    sub "Longhorn System Backup";    k -n "$ns" get systembackups.longhorn.io
+    sub "Longhorn Backups";          k -n "$ns" get backups.longhorn.io --sort-by=.status.snapshotCreatedAt
+    sub "Longhorn Snapshots";        k -n "$ns" get snapshots.longhorn.io --sort-by=.status.creationTime
+    if [ "$KI_METRICS" = "yes" ]; then
+        sub "PODs Resource Consumption"
+        k -n "$ns" top pods | without "(engine-image-|longhorn-csi-plugin-)"
+    fi
+}
+
+storage_section() {
+    section_header "Kubernetes Storage Information"
+    sub "CSI Driver";                      k get csidrivers
+    sub "Storage Class";                   k get storageclass
+    sub "Persistent Volume (PV)";          k get persistentvolume
+    sub "Persistent Volume Claims (PVC)";  k get persistentvolumeclaims --all-namespaces
+    sub "Volume Attachments";              k get volumeattachments.storage.k8s.io
+}
+
+ingress_section() {
+    local ns
+    section_header "Kubernetes Ingress Information"
+    sub "Ingress Classes"
+    k get ingressclass
+    for ns in $KI_INGRESS_NS; do
+        sub "Ingress Controller ($ns)"
+        k -n "$ns" get all -o wide
+    done
+    sub "Ingress Rules"
+    k get ingress --all-namespaces
+    if [ "$KI_GATEWAY_API" = "yes" ]; then
+        sub "Gateway API"
+        k get gatewayclasses,gateways,httproutes --all-namespaces
+    fi
+    if [ "$KI_METRICS" = "yes" ]; then
+        for ns in $KI_INGRESS_NS; do
+            sub "PODs Resource Consumption ($ns)"
+            k -n "$ns" top pods
+        done
+    fi
+}
+
+# "Nov 21 12:00:00 2027 GMT" -> seconds (GNU date, then BSD date)
+to_epoch() {
+    date -u -d "$1" +%s 2>/dev/null || date -u -j -f '%b %e %T %Y %Z' "$1" +%s 2>/dev/null
+}
+
+base64_decode() {
+    if [ -z "$B64_DECODE" ]; then
+        if [ "$(printf 'YQ==' | base64 -d 2>/dev/null)" = "a" ]; then B64_DECODE="base64 -d"
+        elif [ "$(printf 'YQ==' | base64 -D 2>/dev/null)" = "a" ]; then B64_DECODE="base64 -D"
+        else B64_DECODE="openssl base64 -d -A"
+        fi
+    fi
+    $B64_DECODE
+}
+
+# Reads tls.crt (the public certificate) of every Secret of the type kubernetes.io/tls.
+tls_expiry() {
+    local now name crt text end secs days issuer names
+    command -v openssl >/dev/null 2>&1 || { echo "openssl is not installed - the expiry dates cannot be read."; return; }
+    now=$(date -u +%s)
+    B64_DECODE=""; base64_decode </dev/null >/dev/null 2>&1
+    k get secrets --all-namespaces --field-selector type=kubernetes.io/tls \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.data.tls\.crt}{"\n"}{end}' |
+    while read -r name crt; do
+        [ -n "$crt" ] || continue
+        text=$(printf '%s' "$crt" | base64_decode 2>/dev/null | openssl x509 -noout -enddate -issuer -text 2>/dev/null)
+        [ -n "$text" ] || { printf '%s\t%s\t%s\t%s\t%s\n' "99999" "?" "unreadable" "$name" ""; continue; }
+        end=$(printf '%s\n' "$text" | sed -n 's/^notAfter=//p' | head -n 1)
+        secs=$(to_epoch "$end")
+        if [ -n "$secs" ]; then days=$(((secs - now) / 86400)); else days="?"; fi
+        issuer=$(printf '%s\n' "$text" | sed -n 's/^issuer=.*CN *= *//p' | head -n 1)
+        names=$(printf '%s\n' "$text" | awk '/Subject Alternative Name/ {getline; gsub(/^ +/, ""); gsub(/DNS:/, ""); print; exit}')
+        printf '%s\t%s\t%s\t%s\t%s\n' "$days" "$end" "${issuer:--}" "$name" "$names"
+    done | sort -n | awk -F'\t' '
+        { d[NR]=$1; e[NR]=$2; i[NR]=$3; n[NR]=$4; s[NR]=$5
+          if (length($3) > wi) wi = length($3); if (length($4) > wn) wn = length($4) }
+        END {
+          if (NR == 0) { print "No TLS Secrets found."; exit }
+          if (wi < 6) wi = 6; if (wn < 6) wn = 6
+          printf "%-9s  %-24s  %-" wi "s  %-" wn "s  %s\n", "DAYS-LEFT", "NOT-AFTER", "ISSUER", "SECRET", "NAMES"
+          for (r = 1; r <= NR; r++) printf "%-9s  %-24s  %-" wi "s  %-" wn "s  %s\n", d[r], e[r], i[r], n[r], s[r]
+        }'
+}
+
+certificates_section() {
+    section_header "Kubernetes Certificate Information"
+    if [ -n "$KI_CERT_MANAGER_NS" ]; then
+        sub "Cert-Manager Services"
+        k -n "$KI_CERT_MANAGER_NS" get pods,services,deployments -o wide
+        sub "Issuers"
+        k get clusterissuers,issuers --all-namespaces -o wide
+        sub "Certificates"
+        k get certificates --all-namespaces -o wide
+    fi
+    if [ "$KI_TLS_EXPIRY" = "yes" ]; then
+        sub "TLS Certificates by Expiry Date"
+        tls_expiry
+    fi
+    if [ -n "$KI_CERT_MANAGER_NS" ] && [ "$KI_METRICS" = "yes" ]; then
+        sub "PODs Resource Consumption"
+        k -n "$KI_CERT_MANAGER_NS" top pods
+    fi
+}
+
+system_section() {
+    section_header "Kubernetes System Information"
+    sub "Cluster Version"
+    k version
+    sub "API Server Health"
+    # only the checks that fail and the final verdict
+    k get --raw='/readyz?verbose' | grep -v '^\[+\]'
+    sub "Namespaces"
+    k get namespaces
+    sub "System PODs"
+    k -n kube-system get pods -o wide
+    if [ "$KI_METRICS" = "yes" ]; then
+        sub "PODs Resource Consumption"
+        k -n kube-system top pods
+    fi
+}
+
+ETCD_POD=""
+etcd_ctl() {
+    local args=(--endpoints=https://127.0.0.1:2379 "--cacert=$KI_ETCD_CACERT" "--cert=$KI_ETCD_CERT" "--key=$KI_ETCD_KEY")
+    if [ "$KI_ETCD_MODE" = "local" ]; then
+        ETCDCTL_API=3 etcdctl "${args[@]}" "$@"
+    else
+        [ -n "$ETCD_POD" ] || { echo "No running etcd pod found in the namespace $KI_ETCD_NS (selector $KI_ETCD_SELECTOR)."; return 1; }
+        k -n "$KI_ETCD_NS" exec "$ETCD_POD" -- etcdctl "${args[@]}" "$@"
+    fi
+}
+
+etcd_section() {
+    local members line leader endpoint name
+    section_header "Kubernetes ETCD Information"
+    if [ "$KI_ETCD_MODE" != "local" ]; then
+        ETCD_POD=$(k -n "$KI_ETCD_NS" get pods -l "$KI_ETCD_SELECTOR" --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    fi
+    sub "ETCD Member List"
+    etcd_ctl member list --write-out=table
+    sub "ETCD EndPoint Status"
+    etcd_ctl endpoint status --cluster --write-out=table
+    sub "ETCD EndPoint Health"
+    etcd_ctl endpoint health --cluster --write-out=table
+    sub "ETCD Active Node"
+    # member list:     ID, status, name, peer URLs, client URLs, learner
+    # endpoint status: endpoint, ID, version, ..., leader, learner, ... (the columns before "leader" differ by version)
+    members=$(etcd_ctl member list 2>/dev/null)
+    etcd_ctl endpoint status --cluster 2>/dev/null | while IFS= read -r line; do
+        leader=$(printf '%s\n' "$line" | awk -F', ' '{for (i = 2; i <= NF; i++) if ($i == "true" || $i == "false") {print $i; exit}}')
+        [ "$leader" = "true" ] || continue
+        endpoint=${line%%,*}
+        name=$(printf '%s\n' "$members" | awk -F', ' -v ep="$endpoint" '{n = split($5, u, ","); for (i = 1; i <= n; i++) if (u[i] == ep) {print $3; exit}}')
+        echo "${name:-unknown}  ($endpoint)  ==>  ACTIVE LEADER"
+    done
+    if [ "$KI_METRICS" = "yes" ]; then
+        sub "PODs Resource Consumption"
+        k -n "$KI_ETCD_NS" top pods -l "$KI_ETCD_SELECTOR"
+    fi
+}
+
+health_section() {
+    local out
+    section_header "Kubernetes Health Information"
+
+    sub "PODs Not Running or Not Ready"
+    if out=$(k get pods --all-namespaces 2>&1); then
+        printf '%s\n' "$out" | awk '
+            NR == 1 {h = $0; next}
+            $4 == "Completed" {next}
+            {split($3, r, "/")}
+            $4 != "Running" || r[1] != r[2] {if (!n++) print h; print}
+            END {if (!n) print "None - all pods are running and ready."}'
+    else
+        printf '%s\n' "$out"
+    fi
+
+    sub "PODs With the Most Restarts"
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out" | head -n 1
+        printf '%s\n' "$out" | tail -n +2 | awk '$5 + 0 > 0' | sort -k5,5nr | head -n 10
+    fi
+
+    sub "Workloads Not Fully Available"
+    {
+        k get deployments --all-namespaces --no-headers 2>/dev/null  | awk '{split($3, r, "/"); if (r[1] != r[2]) print "deployment", $1, $2, $3}'
+        k get statefulsets --all-namespaces --no-headers 2>/dev/null | awk '{split($3, r, "/"); if (r[1] != r[2]) print "statefulset", $1, $2, $3}'
+        k get daemonsets --all-namespaces --no-headers 2>/dev/null   | awk '$3 != $5 {print "daemonset", $1, $2, $5 "/" $3}'
+    } | awk '
+        {k[NR]=$1; n[NR]=$2; w[NR]=$3; r[NR]=$4
+         if (length($2) > wn) wn = length($2); if (length($3) > ww) ww = length($3)}
+        END {
+          if (NR == 0) { print "None - every Deployment, StatefulSet and DaemonSet has all its pods ready."; exit }
+          if (wn < 9) wn = 9; if (ww < 4) ww = 4
+          printf "%-12s %-" wn "s  %-" ww "s  %s\n", "KIND", "NAMESPACE", "NAME", "READY"
+          for (i = 1; i <= NR; i++) printf "%-12s %-" wn "s  %-" ww "s  %s\n", k[i], n[i], w[i], r[i]
+        }'
+
+    sub "Warning Events (the Latest 15)"
+    if out=$(k get events --all-namespaces --field-selector type=Warning --sort-by=.lastTimestamp 2>&1) && [ "$(printf '%s\n' "$out" | wc -l)" -gt 1 ]; then
+        printf '%s\n' "$out" | head -n 1
+        printf '%s\n' "$out" | tail -n +2 | tail -n 15
+    else
+        printf '%s\n' "${out:-No warning events.}"
+    fi
+}
+
+# run_section <position> - position in KI_SECTIONS, starts at 0
+run_section() {
+    local entry=${KI_SECTIONS[$1]}
+    SEC_NO=$(($1 + 1))
+    case "$entry" in
+        app:*)        app_section "$(app_index "${entry#app:}")" ;;
+        nodes)        nodes_section ;;
+        services)     services_section ;;
+        configmaps)   configmaps_section ;;
+        secrets)      secrets_section ;;
+        longhorn)     longhorn_section ;;
+        storage)      storage_section ;;
+        ingress)      ingress_section ;;
+        certificates) certificates_section ;;
+        system)       system_section ;;
+        etcd)         etcd_section ;;
+        health)       health_section ;;
+        *)            echo "Unknown section in the configuration: $entry" ;;
+    esac
+    echo
+}
+
+# section_position <name> -> position in KI_SECTIONS
+section_position() {
+    local want="$1" i=0 entry
+    case "$want" in
+        service) want="services" ;; configmap) want="configmaps" ;; secret) want="secrets" ;;
+        cert-manager) want="certificates" ;;
+    esac
+    while [ "$i" -lt "${#KI_SECTIONS[@]}" ]; do
+        entry=${KI_SECTIONS[$i]}
+        if [ "$entry" = "$want" ] || [ "$entry" = "app:$want" ]; then echo "$i"; return 0; fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# Environments - one configuration per cluster (production, staging, ...)
+# ----------------------------------------------------------------------
+list_envs() {
+    local d f
+    for d in "$(user_config_dir)" /etc/k8s-info; do
+        for f in "$d"/*.conf; do [ -r "$f" ] && basename "$f" .conf; done
+    done | sort -u
+}
+
+env_exists() { [ -n "$1" ] && list_envs | grep -qx -- "$1"; }
+
+# the environment that is used when none is named
+default_env() {
+    local d name
+    for d in "$(user_config_dir)" /etc/k8s-info; do
+        if [ -r "$d/default" ]; then
+            name=$(head -n 1 "$d/default")
+            env_exists "$name" && { echo "$name"; return; }
+        fi
+    done
+    name=$(list_envs | head -n 1)
+    echo "${name:-default}"
+}
+
+# env_cluster <environment> - how this environment reaches its cluster
+env_cluster() {
+    (
+        PROFILE="$1"; CONFIG_FILE=""; KI_KUBECONFIG=""; KI_CONTEXT=""
+        . "$(find_config)" 2>/dev/null
+        if [ -n "$KI_KUBECONFIG" ] && [ -n "$KI_CONTEXT" ]; then echo "kubeconfig $KI_KUBECONFIG, context $KI_CONTEXT"
+        elif [ -n "$KI_KUBECONFIG" ]; then echo "kubeconfig $KI_KUBECONFIG"
+        elif [ -n "$KI_CONTEXT" ]; then echo "kubectl context $KI_CONTEXT"
+        else echo "current context of kubectl"
+        fi
+    )
+}
+
+usage() {
+    cat <<EOF
+${BOLD}$PROG${NC} $VERSION - Kubernetes cluster status report (read only)
+
+${BOLD}Usage${NC}
+  $PROG                                the whole report
+  $PROG <section> [...]                one or more sections
+  $PROG <environment> [<section> ...]  the same for another cluster, e.g. $PROG staging nodes
+  $PROG setup                          change the setup: add a cluster, change or remove one
+  $PROG config                         show the configuration file
+  $PROG --help                         this text, the environments and the sections
+
+${BOLD}Options${NC}
+  -e, --env <name>          environment (the same as naming it first)
+  -c, --config <file>       use this configuration file
+      --context <name>      kubectl context (setup: for the cluster to add)
+      --kubeconfig <file>   setup: kubeconfig file of the cluster to add
+  -y, --yes                 setup: take every suggestion, ask nothing
+      --no-color, --color   switch colours off / on (default: on in a terminal)
+EOF
+}
+
+help_envs() {
+    local e default
+    default=$(default_env)
+    echo
+    echo "${BOLD}Environments${NC}"
+    for e in $(list_envs); do
+        printf '  %s%-14s%s %s%s\n' "$BOLD" "$e" "$NC" "$(env_cluster "$e")" "$([ "$e" = "$default" ] && echo "  <- used when none is named")"
+    done
+}
+
+help_sections() {
+    local i=0 entry name
+    echo
+    echo "${BOLD}Sections${NC}${PROFILE:+ of $PROFILE} ($CONFIG)"
+    while [ "$i" -lt "${#KI_SECTIONS[@]}" ]; do
+        entry=${KI_SECTIONS[$i]}; name=${entry#app:}
+        echo "${BOLD}• $name${NC}"
+        echo "  $(section_description "$entry")"
+        i=$((i + 1))
+    done
+    if [ "$(list_envs | grep -c .)" -gt 1 ]; then
+        echo
+        echo "Another environment may have other sections: $PROG <environment> --help"
+    fi
+}
+
+# ======================================================================
+# Setup
+# ======================================================================
+ask() { # ask <question> <default> -> REPLY
+    local answer
+    if [ "$ASSUME_YES" = "yes" ]; then REPLY="$2"; return; fi
+    if [ -n "$2" ]; then printf '%s [%s]: ' "$1" "$2"; else printf '%s: ' "$1"; fi
+    IFS= read -r answer || { answer=""; echo; }
+    REPLY="${answer:-$2}"
+}
+
+ask_yes() { # ask_yes <question> <y|n> -> exit status 0 = yes
+    local hint="y/N"
+    [ "$2" = "y" ] && hint="Y/n"
+    while :; do
+        ask "$1 ($hint)" ""
+        case "${REPLY:-$2}" in
+            y|Y|yes|Yes|YES) return 0 ;;
+            n|N|no|No|NO)    return 1 ;;
+        esac
+        echo "Please answer y or n."
+    done
+}
+
+is_number() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+
+# choose_one <question> <default number> <option...> -> CHOICE (number, starts at 1)
+choose_one() {
+    local question="$1" default="$2" i=1 opt
+    shift 2
+    CHOICE="$default"
+    [ "$ASSUME_YES" = "yes" ] && return
+    echo
+    echo "${BOLD}$question${NC}"
+    for opt in "$@"; do printf '  %2d) %s\n' "$i" "$opt"; i=$((i + 1)); done
+    while :; do
+        ask "Number" "$default"
+        if is_number "$REPLY" && [ "$REPLY" -ge 1 ] && [ "$REPLY" -le $# ]; then CHOICE="$REPLY"; return; fi
+        echo "Please type a number from 1 to $#."
+    done
+}
+
+# choose_many <question> - works on MENU_ITEMS / MENU_NOTES / MENU_ON (yes|no)
+MENU_ITEMS=(); MENU_NOTES=(); MENU_ON=()
+menu_reset() { MENU_ITEMS=(); MENU_NOTES=(); MENU_ON=(); }
+menu_add()   { MENU_ITEMS+=("$1"); MENU_NOTES+=("$2"); MENU_ON+=("$3"); }
+
+menu_toggle() {
+    local i=$(($1 - 1))
+    [ "$i" -ge 0 ] && [ "$i" -lt "${#MENU_ITEMS[@]}" ] || { echo "No line $1."; return; }
+    if [ "${MENU_ON[$i]}" = "yes" ]; then MENU_ON[$i]="no"; else MENU_ON[$i]="yes"; fi
+}
+
+choose_many() {
+    local question="$1" count=${#MENU_ITEMS[@]} i mark answer token from to
+    [ "$ASSUME_YES" = "yes" ] && return
+    [ "$count" -gt 0 ] || return
+    while :; do
+        echo
+        echo "${BOLD}$question${NC}"
+        i=0
+        while [ "$i" -lt "$count" ]; do
+            mark=" "; [ "${MENU_ON[$i]}" = "yes" ] && mark="x"
+            printf '  [%s] %2d) %-30s %s\n' "$mark" $((i + 1)) "${MENU_ITEMS[$i]}" "${MENU_NOTES[$i]}"
+            i=$((i + 1))
+        done
+        printf 'Numbers switch lines on or off (2 5 or 3-6), a = all, n = none, Enter = continue: '
+        IFS= read -r answer || { echo; break; }
+        [ -n "$answer" ] || break
+        for token in ${answer//,/ }; do
+            case "$token" in
+                a|A) i=0; while [ "$i" -lt "$count" ]; do MENU_ON[$i]="yes"; i=$((i + 1)); done ;;
+                n|N) i=0; while [ "$i" -lt "$count" ]; do MENU_ON[$i]="no"; i=$((i + 1)); done ;;
+                *-*)
+                    from=${token%-*}; to=${token#*-}
+                    if is_number "$from" && is_number "$to" && [ "$from" -le "$to" ]; then
+                        while [ "$from" -le "$to" ]; do menu_toggle "$from"; from=$((from + 1)); done
+                    else
+                        echo "Not understood: $token"
+                    fi ;;
+                *)  if is_number "$token"; then menu_toggle "$token"; else echo "Not understood: $token"; fi ;;
+            esac
+        done
+    done
+}
+
+step() { echo; echo "${YELLOW}${BOLD}$1${NC}"; echo "${CYAN}$(line '═' ${#1})${NC}"; }
+found() { printf '  %s%-18s%s %s\n' "$GREEN" "$1" "$NC" "$2"; }
+missing() { printf '  %s%-18s%s %s\n' "$CYAN" "$1" "$NC" "$2"; }
+
+write_list() { # write_list <name> <values...>
+    local name="$1" v; shift
+    printf '%s=(' "$name"
+    for v in "$@"; do printf ' %q' "$v"; done
+    printf ' )\n'
+}
+
+write_config() {
+    local file="$1"
+    {
+        echo "# k8s-info configuration - written by '$PROG setup' on $(date +'%Y-%m-%d %H:%M')"
+        echo "# This file may be changed by hand. '$PROG setup' writes it again (the old one is kept as .bak)."
+        echo
+        echo "# Title of the report"
+        printf 'KI_TITLE=%q\n' "$KI_TITLE"
+        echo
+        echo "# How the cluster is reached. Empty context = the current context of kubectl."
+        printf 'KI_KUBECTL=%q\n' "$KI_KUBECTL"
+        printf 'KI_KUBECONFIG=%q\n' "$KI_KUBECONFIG"
+        printf 'KI_CONTEXT=%q\n' "$KI_CONTEXT"
+        echo
+        echo "# yes = the cluster has a metrics API (kubectl top works)"
+        printf 'KI_METRICS=%q\n' "$KI_METRICS"
+        echo
+        echo "# The sections in the order of the report. app:<key> = a namespace from the lists below."
+        echo "# Built in: $BUILTIN_SECTIONS"
+        write_list KI_SECTIONS "${KI_SECTIONS[@]}"
+        echo
+        echo "# Namespace sections - one column per namespace, the same position in every list:"
+        echo "#   KEY = name on the command line, TITLE = name in the report,"
+        echo "#   RESOURCES = what 'kubectl get' lists, CONTAINERS = yes lists the containers of every pod,"
+        echo "#   EXCLUDE = extended regular expression, matching lines are left out"
+        write_list KI_APP_KEY "${KI_APP_KEY[@]}"
+        write_list KI_APP_NS "${KI_APP_NS[@]}"
+        write_list KI_APP_TITLE "${KI_APP_TITLE[@]}"
+        write_list KI_APP_RESOURCES "${KI_APP_RESOURCES[@]}"
+        write_list KI_APP_CONTAINERS "${KI_APP_CONTAINERS[@]}"
+        write_list KI_APP_EXCLUDE "${KI_APP_EXCLUDE[@]}"
+        echo
+        echo "# Section longhorn"
+        printf 'KI_LONGHORN_NS=%q\n' "$KI_LONGHORN_NS"
+        echo
+        echo "# Section ingress - namespaces of the ingress controllers (separated by spaces)"
+        printf 'KI_INGRESS_NS=%q\n' "$KI_INGRESS_NS"
+        printf 'KI_GATEWAY_API=%q\n' "$KI_GATEWAY_API"
+        echo
+        echo "# Section certificates - empty namespace = no cert-manager;"
+        echo "# TLS_EXPIRY = yes reads tls.crt (the public certificate) of every TLS Secret"
+        printf 'KI_CERT_MANAGER_NS=%q\n' "$KI_CERT_MANAGER_NS"
+        printf 'KI_TLS_EXPIRY=%q\n' "$KI_TLS_EXPIRY"
+        echo
+        echo "# Section etcd - MODE local = etcdctl on this machine, exec = etcdctl inside the etcd pod"
+        printf 'KI_ETCD_MODE=%q\n' "$KI_ETCD_MODE"
+        printf 'KI_ETCD_NS=%q\n' "$KI_ETCD_NS"
+        printf 'KI_ETCD_SELECTOR=%q\n' "$KI_ETCD_SELECTOR"
+        printf 'KI_ETCD_CACERT=%q\n' "$KI_ETCD_CACERT"
+        printf 'KI_ETCD_CERT=%q\n' "$KI_ETCD_CERT"
+        printf 'KI_ETCD_KEY=%q\n' "$KI_ETCD_KEY"
+    } > "$file"
+}
+
+# install_command - copies this file into a directory of the PATH
+install_command() {
+    local self target dir name="k8s-info" options=() dirs=() existing
+    self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    existing=$(command -v "$name" 2>/dev/null)
+    if [ -n "$existing" ] && [ "$existing" -ef "$self" ]; then
+        echo "The command is already installed: $existing"
+        return
+    fi
+    if [ "$ASSUME_YES" = "yes" ]; then
+        echo "Not installed (no questions asked). Run it as: $self"
+        return
+    fi
+    for dir in /usr/local/bin "$HOME/.local/bin" "$HOME/bin"; do
+        dirs+=("$dir"); options+=("$dir/$name")
+    done
+    options+=("Do not install - I run it from $self")
+    choose_one "Where shall the command be installed?" 1 "${options[@]}"
+    [ "$CHOICE" -le "${#dirs[@]}" ] || { echo "Not installed. Run it as: $self"; return; }
+    dir=${dirs[$((CHOICE - 1))]}
+
+    while :; do
+        target="$dir/$name"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            echo
+            echo "${YELLOW}$target exists already$([ -L "$target" ] && echo " (a link to $(readlink "$target"))").${NC}"
+            if ask_yes "Replace it?" n; then break; fi
+            ask "Another name for the command (empty = do not install)" ""
+            [ -n "$REPLY" ] || { echo "Not installed. Run it as: $self"; return; }
+            name="$REPLY"
+        else
+            break
+        fi
+    done
+
+    if { [ -d "$dir" ] && [ -w "$dir" ]; } || mkdir -p "$dir" 2>/dev/null && [ -w "$dir" ]; then
+        rm -f "$target" && cp "$self" "$target" && chmod 755 "$target"
+    elif command -v sudo >/dev/null 2>&1 && ask_yes "$dir needs administrator rights. Use sudo?" y; then
+        sudo mkdir -p "$dir" && sudo rm -f "$target" && sudo cp "$self" "$target" && sudo chmod 755 "$target"
+    else
+        echo "Not installed. Run it as: $self"; return
+    fi
+    if [ -x "$target" ]; then
+        echo "${GREEN}Installed: $target${NC}"
+        case ":$PATH:" in *":$dir:"*) ;; *) echo "${YELLOW}$dir is not in your PATH - add it or call $target.${NC}" ;; esac
+        INSTALLED_NAME="$name"
+    else
+        echo "${RED}The installation failed. Run it as: $self${NC}"
+    fi
+}
+
+# context_used_by <context> - the other environment that uses this kubectl context
+context_used_by() {
+    local e
+    for e in $(list_envs); do
+        [ "$e" = "$ENV_NAME" ] && continue
+        if ( PROFILE="$e"; CONFIG_FILE=""; KI_KUBECONFIG=""; KI_CONTEXT=""
+             . "$(find_config)" 2>/dev/null; [ -z "$KI_KUBECONFIG" ] && [ "$KI_CONTEXT" = "$1" ] ); then
+            echo "$e"; return
+        fi
+    done
+}
+
+# setup_connection - asks how the cluster is reached; sets KI_KUBECONFIG, KI_CONTEXT, NAMESPACES
+setup_connection() {
+    local contexts current ctx used note candidate i default first_free path
+    local options=() kinds=() values=()
+    while :; do
+        if [ -n "$OPT_KUBECONFIG" ] || [ -n "$OPT_CONTEXT" ]; then
+            KI_KUBECONFIG="$OPT_KUBECONFIG"; KI_CONTEXT="$OPT_CONTEXT"
+        elif [ "$KEEP_CONNECTION" != "yes" ]; then
+            options=(); kinds=(); values=(); i=1; default=""; first_free=""
+            contexts=$($KI_KUBECTL config get-contexts -o name 2>/dev/null)
+            current=$($KI_KUBECTL config current-context 2>/dev/null)
+            while IFS= read -r ctx; do
+                [ -n "$ctx" ] || continue
+                note=""
+                [ "$ctx" = "$current" ] && note=" (the current one)"
+                used=$(context_used_by "$ctx")
+                if [ -n "$used" ]; then
+                    note="$note - already used by the environment $used"
+                else
+                    [ -z "$first_free" ] && first_free=$i
+                    [ "$ctx" = "$current" ] && default=$i
+                fi
+                options+=("kubectl context: $ctx$note"); kinds+=("context"); values+=("$ctx")
+                i=$((i + 1))
+            done <<EOF
+$contexts
+EOF
+            for candidate in /etc/kubernetes/admin.conf /etc/rancher/k3s/k3s.yaml; do
+                if [ -r "$candidate" ]; then
+                    options+=("Kubeconfig file: $candidate"); kinds+=("file"); values+=("$candidate")
+                fi
+            done
+            if [ -z "$contexts" ]; then
+                options+=("Nothing special - kubectl works as it is (for example inside the cluster)"); kinds+=("plain"); values+=("")
+            fi
+            options+=("Another kubeconfig file - I type the path"); kinds+=("ask"); values+=("")
+            choose_one "How is this cluster reached?" "${default:-${first_free:-1}}" "${options[@]}"
+            case "${kinds[$((CHOICE - 1))]}" in
+                context) KI_CONTEXT=${values[$((CHOICE - 1))]}; KI_KUBECONFIG="" ;;
+                file)    KI_KUBECONFIG=${values[$((CHOICE - 1))]}; KI_CONTEXT="" ;;
+                plain)   KI_KUBECONFIG=""; KI_CONTEXT="" ;;
+                ask)
+                    ask "Path of the kubeconfig file" ""
+                    path="$REPLY"
+                    case "$path" in "~/"*) path="$HOME/${path#\~/}" ;; esac
+                    if [ ! -r "$path" ] || [ -d "$path" ]; then echo "${RED}This file cannot be read: ${path:-(empty)}${NC}"; continue; fi
+                    KI_KUBECONFIG="$(cd "$(dirname "$path")" && pwd)/$(basename "$path")"; KI_CONTEXT="" ;;
+            esac
+            # a file may hold several clusters
+            if [ -n "$KI_KUBECONFIG" ]; then
+                contexts=$($KI_KUBECTL --kubeconfig "$KI_KUBECONFIG" config get-contexts -o name 2>/dev/null)
+                if [ "$(printf '%s\n' "$contexts" | grep -c .)" -gt 1 ]; then
+                    options=()
+                    while IFS= read -r ctx; do options+=("$ctx"); done <<EOF
+$contexts
+EOF
+                    choose_one "This file knows several clusters. Which one?" 1 "${options[@]}"
+                    KI_CONTEXT=${options[$((CHOICE - 1))]}
+                fi
+            fi
+        fi
+
+        if NAMESPACES=$(k get namespaces -o name 2>&1); then break; fi
+        echo
+        printf '%s\n' "$NAMESPACES"
+        if k get --raw=/version >/dev/null 2>&1; then
+            echo "The cluster answers, but this account may not list namespaces."
+            ask "Namespaces for the report, separated by spaces (empty = stop)" ""
+            [ -n "$REPLY" ] || die "No namespaces - nothing to report."
+            NAMESPACES=$(for ctx in $REPLY; do echo "namespace/$ctx"; done)
+            break
+        fi
+        echo "${RED}The cluster does not answer this way.${NC}"
+        if [ "$ASSUME_YES" = "yes" ] || [ -n "$OPT_KUBECONFIG" ] || [ -n "$OPT_CONTEXT" ]; then die "No connection to the cluster."; fi
+        KEEP_CONNECTION="no"
+        ask_yes "Try another way?" y || die "No connection to the cluster."
+    done
+    [ -n "$KI_KUBECONFIG" ] && found "Kubeconfig" "$KI_KUBECONFIG"
+    [ -n "$KI_CONTEXT" ] && found "Context" "$KI_CONTEXT"
+    [ -z "$KI_KUBECONFIG$KI_CONTEXT" ] && found "Cluster" "the one kubectl uses by itself"
+    NAMESPACES=$(printf '%s\n' "$NAMESPACES" | sed 's|^namespace/||')
+    found "Namespaces" "$(printf '%s\n' "$NAMESPACES" | grep -c .)"
+}
+
+# setup_env_name - asks for the name of the environment when none was given
+setup_env_name() {
+    local suggestion
+    [ -n "$ENV_NAME" ] && return
+    suggestion=$(printf '%s' "$KI_CONTEXT" | tr -c 'A-Za-z0-9._-' '-')
+    [ -n "$suggestion" ] || suggestion="default"
+    in_list "$suggestion" $RESERVED_WORDS && suggestion="cluster-$suggestion"
+    while :; do
+        echo
+        echo "Give this cluster a short name. You use it on the command line: $PROG <name> nodes"
+        ask "Name of this environment (for example production, staging)" "$suggestion"
+        ENV_NAME="$REPLY"
+        case "$ENV_NAME" in
+            ''|*[!A-Za-z0-9._-]*|.*|-*) echo "Please use only letters, digits, dot, dash and underscore."; ENV_NAME=""; [ "$ASSUME_YES" = "yes" ] && die "Not a usable name."; continue ;;
+        esac
+        if in_list "$ENV_NAME" $RESERVED_WORDS; then
+            echo "\"$ENV_NAME\" is the name of a section or a command - please take another one."; ENV_NAME=""
+            [ "$ASSUME_YES" = "yes" ] && die "Not a usable name."
+            continue
+        fi
+        if env_exists "$ENV_NAME" && [ "$ASSUME_YES" != "yes" ]; then
+            ask_yes "An environment \"$ENV_NAME\" exists already. Replace it?" n || { ENV_NAME=""; continue; }
+        fi
+        break
+    done
+    found "Environment" "$ENV_NAME"
+}
+
+old_app_index() { # old_app_index <namespace> -> every old column of this namespace
+    local i=0
+    while [ "$i" -lt "${#OLD_APP_NS[@]}" ]; do
+        [ "${OLD_APP_NS[$i]}" = "$1" ] && echo "$i"
+        i=$((i + 1))
+    done
+}
+
+# setup_one <environment or empty> <new|change>
+setup_one() {
+    local mode="$2" ns pods note on i j key candidate etcd_command covered="" old_tls=""
+    local pods_raw pvc_raw workloads api_resources
+    local app_ns=() selected=() new_sections=()
+    local OLD_APP_KEY=() OLD_APP_NS=() OLD_APP_TITLE=() OLD_APP_RESOURCES=() OLD_APP_CONTAINERS=() OLD_APP_EXCLUDE=() OLD_SECTIONS=()
+
+    ENV_NAME="$1"
+    HAVE_OLD="no"; KEEP_CONNECTION="no"
+    config_defaults
+    KI_KUBECONFIG=""; KI_CONTEXT=""
+    PROFILE="$ENV_NAME"
+
+    if [ "$mode" = "change" ]; then
+        CONFIG=$(find_config)
+        if [ -r "$CONFIG" ] && . "$CONFIG"; then
+            HAVE_OLD="yes"
+            OLD_APP_KEY=("${KI_APP_KEY[@]}"); OLD_APP_NS=("${KI_APP_NS[@]}"); OLD_APP_TITLE=("${KI_APP_TITLE[@]}")
+            OLD_APP_RESOURCES=("${KI_APP_RESOURCES[@]}"); OLD_APP_CONTAINERS=("${KI_APP_CONTAINERS[@]}")
+            OLD_APP_EXCLUDE=("${KI_APP_EXCLUDE[@]}"); OLD_SECTIONS=("${KI_SECTIONS[@]}")
+            old_tls="$KI_TLS_EXPIRY"
+            KI_APP_KEY=(); KI_APP_NS=(); KI_APP_TITLE=(); KI_APP_RESOURCES=(); KI_APP_CONTAINERS=(); KI_APP_EXCLUDE=(); KI_SECTIONS=()
+        fi
+    fi
+    KI_KUBECTL="$SETUP_KUBECTL"
+
+    # ---- 1. the cluster ------------------------------------------------
+    step "1. Connection to the Cluster${ENV_NAME:+ - $ENV_NAME}"
+    found "Command" "$KI_KUBECTL"
+    if [ "$HAVE_OLD" = "yes" ] && [ -z "$OPT_KUBECONFIG$OPT_CONTEXT" ]; then
+        echo "  Until now: $(env_cluster "$ENV_NAME")"
+        if [ "$ASSUME_YES" = "yes" ] || ask_yes "Keep this connection?" y; then KEEP_CONNECTION="yes"; fi
+    fi
+    setup_connection
+    setup_env_name
+    PROFILE="$ENV_NAME"
+
+    # ---- 2. what is in the cluster -----------------------------------
+    step "2. What Is in the Cluster"
+    pods_raw=$(k get pods --all-namespaces --no-headers -o custom-columns='NS:.metadata.namespace,C:.spec.containers[*].name' 2>/dev/null)
+    pvc_raw=$(k get persistentvolumeclaims --all-namespaces --no-headers -o custom-columns='NS:.metadata.namespace' 2>/dev/null)
+    workloads=$(k get deployments,daemonsets,statefulsets --all-namespaces --no-headers \
+        -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,IMAGE:.spec.template.spec.containers[*].image' 2>/dev/null)
+    api_resources=$(k api-resources -o name 2>/dev/null)
+
+    found "Nodes" "$(k get nodes --no-headers 2>/dev/null | grep -c .)"
+    found "Pods" "$(printf '%s\n' "$pods_raw" | grep -c .)"
+
+    if k top nodes >/dev/null 2>&1; then
+        KI_METRICS="yes"; found "Metrics API" "yes - the report shows CPU and memory consumption"
+    else
+        KI_METRICS="no"; missing "Metrics API" "not found - the report leaves the consumption tables out"
+    fi
+
+    HAS_LONGHORN="no"
+    if printf '%s\n' "$api_resources" | grep -q '^volumes\.longhorn\.io$'; then
+        HAS_LONGHORN="yes"
+        ns=$(printf '%s\n' "$workloads" | awk '$2 == "longhorn-manager" {print $1; exit}')
+        KI_LONGHORN_NS=${ns:-longhorn-system}
+        found "Longhorn" "namespace $KI_LONGHORN_NS"
+    else
+        missing "Longhorn" "not found"
+    fi
+
+    KI_INGRESS_NS=$(printf '%s\n' "$workloads" |
+        awk '$2 ~ /ingress|traefik|contour|kong/ || $3 ~ /ingress|traefik|contour|kong|envoy-gateway|nginx-gateway/ {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+    if [ -n "$KI_INGRESS_NS" ]; then found "Ingress controller" "namespace $KI_INGRESS_NS"; else missing "Ingress controller" "not found"; fi
+    KI_GATEWAY_API="no"
+    if printf '%s\n' "$api_resources" | grep -q '^gateways\.gateway\.networking\.k8s\.io$'; then
+        KI_GATEWAY_API="yes"; found "Gateway API" "yes"
+    fi
+
+    KI_CERT_MANAGER_NS=""
+    if printf '%s\n' "$api_resources" | grep -q '^certificates\.cert-manager\.io$'; then
+        ns=$(printf '%s\n' "$workloads" | awk '$2 == "cert-manager" || $3 ~ /cert-manager-controller/ {print $1; exit}')
+        KI_CERT_MANAGER_NS=${ns:-cert-manager}
+        found "cert-manager" "namespace $KI_CERT_MANAGER_NS"
+    else
+        missing "cert-manager" "not found"
+    fi
+
+    HAS_ETCD="no"
+    if [ "$(k -n "$KI_ETCD_NS" get pods -l "$KI_ETCD_SELECTOR" --no-headers 2>/dev/null | grep -c .)" -gt 0 ]; then
+        HAS_ETCD="yes"
+        # the certificate paths are read from the command line of the etcd pod
+        etcd_command=$(k -n "$KI_ETCD_NS" get pods -l "$KI_ETCD_SELECTOR" -o jsonpath='{.items[0].spec.containers[0].command}' 2>/dev/null | tr '",[]' '\n\n\n\n')
+        candidate=$(printf '%s\n' "$etcd_command" | sed -n 's/^--trusted-ca-file=//p' | head -n 1); [ -n "$candidate" ] && KI_ETCD_CACERT="$candidate"
+        candidate=$(printf '%s\n' "$etcd_command" | sed -n 's/^--cert-file=//p' | head -n 1);       [ -n "$candidate" ] && KI_ETCD_CERT="$candidate"
+        candidate=$(printf '%s\n' "$etcd_command" | sed -n 's/^--key-file=//p' | head -n 1);        [ -n "$candidate" ] && KI_ETCD_KEY="$candidate"
+        if command -v etcdctl >/dev/null 2>&1 && [ -r "$KI_ETCD_KEY" ]; then
+            KI_ETCD_MODE="local"; found "etcd" "pods in $KI_ETCD_NS - read with etcdctl on this machine"
+        else
+            KI_ETCD_MODE="exec"; found "etcd" "pods in $KI_ETCD_NS - read with etcdctl inside the etcd pod (kubectl exec)"
+        fi
+    else
+        missing "etcd" "no etcd pods (managed or external control plane)"
+    fi
+
+    # ---- 3. report title ---------------------------------------------
+    step "3. Title of the Report"
+    ask "Title" "$KI_TITLE"
+    KI_TITLE="$REPLY"
+    [ "$ASSUME_YES" = "yes" ] && echo "  $KI_TITLE"
+
+    # ---- 4. namespaces ------------------------------------------------
+    step "4. Namespaces"
+    echo "Every namespace you pick becomes its own section: resources, containers, consumption."
+    [ "$HAVE_OLD" = "yes" ] && echo "The marks show your choice of the last setup."
+    [ "$HAS_LONGHORN" = "yes" ] && covered="$covered $KI_LONGHORN_NS"
+    covered="$covered $KI_INGRESS_NS $KI_CERT_MANAGER_NS kube-system"
+    menu_reset
+    while IFS= read -r ns; do
+        [ -n "$ns" ] || continue
+        pods=$(printf '%s\n' "$pods_raw" | awk -v n="$ns" '$1 == n {c++} END {print c + 0}')
+        note="$pods pods"; on="yes"
+        [ "$pods" = "1" ] && note="1 pod"
+        if in_list "$ns" $covered; then note="$note - already part of a cluster section"; on="no"; fi
+        if [ "$pods" = "0" ]; then on="no"; fi
+        case "$ns" in kube-public|kube-node-lease) on="no" ;; esac
+        if [ "$HAVE_OLD" = "yes" ]; then
+            if in_list "$ns" "${OLD_APP_NS[@]}"; then on="yes"; else on="no"; fi
+        fi
+        menu_add "$ns" "$note" "$on"
+        app_ns+=("$ns")
+    done <<EOF
+$NAMESPACES
+EOF
+    choose_many "Which namespaces shall the report show?"
+
+    i=0
+    while [ "$i" -lt "${#app_ns[@]}" ]; do
+        if [ "${MENU_ON[$i]}" = "yes" ]; then
+            ns=${app_ns[$i]}
+            if in_list "$ns" "${OLD_APP_NS[@]}"; then
+                # kept as it was, also what was changed by hand in the file
+                for j in $(old_app_index "$ns"); do
+                    KI_APP_KEY+=("${OLD_APP_KEY[$j]}"); KI_APP_NS+=("$ns"); KI_APP_TITLE+=("${OLD_APP_TITLE[$j]}")
+                    KI_APP_RESOURCES+=("${OLD_APP_RESOURCES[$j]}"); KI_APP_CONTAINERS+=("${OLD_APP_CONTAINERS[$j]}")
+                    KI_APP_EXCLUDE+=("${OLD_APP_EXCLUDE[$j]}")
+                done
+            else
+                key="$ns"
+                in_list "$key" $RESERVED_WORDS && key="ns-$ns"
+                KI_APP_KEY+=("$key"); KI_APP_NS+=("$ns"); KI_APP_TITLE+=("$ns"); KI_APP_EXCLUDE+=("")
+                if printf '%s\n' "$pvc_raw" | grep -qx -- "$ns"; then KI_APP_RESOURCES+=("all,pvc"); else KI_APP_RESOURCES+=("all"); fi
+                if printf '%s\n' "$pods_raw" | awk -v n="$ns" '$1 == n && $2 ~ /,/ {f = 1} END {exit !f}'; then
+                    KI_APP_CONTAINERS+=("yes")
+                else
+                    KI_APP_CONTAINERS+=("no")
+                fi
+            fi
+        fi
+        i=$((i + 1))
+    done
+    [ "$ASSUME_YES" = "yes" ] && echo "  Taken: ${KI_APP_NS[*]:-none}"
+
+    if [ "${#KI_APP_NS[@]}" -gt 0 ] && [ "$ASSUME_YES" != "yes" ]; then
+        echo
+        echo "A section is called like its namespace, for example:"
+        echo "  \"N. Kubernetes ${KI_APP_TITLE[0]} Information\", command: $PROG ${KI_APP_KEY[0]}"
+        if ask_yes "Do you want to give the sections your own titles (e.g. \"Shop Backend\")?" n; then
+            i=0
+            while [ "$i" -lt "${#KI_APP_NS[@]}" ]; do
+                ask "  Title for ${KI_APP_NS[$i]}" "${KI_APP_TITLE[$i]}"
+                KI_APP_TITLE[$i]="$REPLY"
+                i=$((i + 1))
+            done
+        fi
+    fi
+
+    # ---- 5. cluster sections -------------------------------------------
+    step "5. Cluster Sections"
+    menu_reset
+    menu_add "nodes"        "status, consumption, capacity" "yes"
+    menu_add "services"     "Services of all namespaces" "yes"
+    if [ "${#KI_APP_NS[@]}" -gt 0 ]; then
+        menu_add "configmaps" "ConfigMaps of your namespaces" "yes"
+        menu_add "secrets"    "names and types only, never the values" "yes"
+    fi
+    [ "$HAS_LONGHORN" = "yes" ] && menu_add "longhorn" "volumes, replicas, backups, snapshots" "yes"
+    menu_add "storage"      "storage classes, volumes, claims" "yes"
+    menu_add "ingress"      "ingress classes, controller, rules" "yes"
+    menu_add "certificates" "cert-manager and expiry dates of TLS certificates" "yes"
+    menu_add "system"       "version, API health, kube-system pods" "yes"
+    [ "$HAS_ETCD" = "yes" ] && menu_add "etcd" "members, status, leader" "yes"
+    menu_add "health"       "pods not ready, restarts, warning events" "yes"
+    if [ "$HAVE_OLD" = "yes" ]; then
+        i=0
+        while [ "$i" -lt "${#MENU_ITEMS[@]}" ]; do
+            if in_list "${MENU_ITEMS[$i]}" "${OLD_SECTIONS[@]}"; then MENU_ON[$i]="yes"; else MENU_ON[$i]="no"; fi
+            i=$((i + 1))
+        done
+    fi
+    choose_many "Which cluster sections shall the report show?"
+
+    selected=()
+    i=0
+    while [ "$i" -lt "${#MENU_ITEMS[@]}" ]; do
+        [ "${MENU_ON[$i]}" = "yes" ] && selected+=("${MENU_ITEMS[$i]}")
+        i=$((i + 1))
+    done
+    [ "$ASSUME_YES" = "yes" ] && echo "  Taken: ${selected[*]}"
+
+    KI_TLS_EXPIRY="no"
+    if in_list "certificates" "${selected[@]}"; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            echo "openssl is not installed here - the expiry dates of the TLS certificates are left out."
+        elif [ "$ASSUME_YES" = "yes" ] && [ -n "$old_tls" ]; then
+            KI_TLS_EXPIRY="$old_tls"
+        elif ask_yes "Show the expiry date of every TLS certificate? This reads the public certificate (tls.crt) from the TLS Secrets." "$([ "$old_tls" = "no" ] && echo n || echo y)"; then
+            KI_TLS_EXPIRY="yes"
+        fi
+    fi
+
+    # order of the report: nodes, namespaces, then the cluster sections;
+    # after a change the old order stays and new sections go to the end
+    in_list "nodes" "${selected[@]}" && new_sections+=("nodes")
+    for key in "${KI_APP_KEY[@]}"; do new_sections+=("app:$key"); done
+    for key in $BUILTIN_SECTIONS; do
+        [ "$key" = "nodes" ] && continue
+        in_list "$key" "${selected[@]}" && new_sections+=("$key")
+    done
+    [ "${#new_sections[@]}" -gt 0 ] || die "No section was chosen - nothing to write."
+    KI_SECTIONS=()
+    for key in "${OLD_SECTIONS[@]}"; do
+        in_list "$key" "${new_sections[@]}" && KI_SECTIONS+=("$key")
+    done
+    for key in "${new_sections[@]}"; do
+        in_list "$key" "${KI_SECTIONS[@]}" || KI_SECTIONS+=("$key")
+    done
+
+    # ---- 6. summary and writing ----------------------------------------
+    step "6. Summary"
+    if [ -n "$CONFIG_FILE" ]; then CONFIG="$CONFIG_FILE"
+    elif [ "$HAVE_OLD" != "yes" ]; then CONFIG="$(user_config_dir)/$ENV_NAME.conf"
+    fi
+    echo "  Environment:    $ENV_NAME"
+    echo "  Title:          $KI_TITLE"
+    echo "  Cluster:        $(if [ -n "$KI_KUBECONFIG" ]; then echo "kubeconfig $KI_KUBECONFIG${KI_CONTEXT:+, context $KI_CONTEXT}"; else echo "${KI_CONTEXT:-current context of $KI_KUBECTL}"; fi)"
+    echo "  Configuration:  $CONFIG"
+    echo "  Sections:"
+    i=0
+    while [ "$i" -lt "${#KI_SECTIONS[@]}" ]; do
+        printf '    %2d. %-22s %s\n' $((i + 1)) "${KI_SECTIONS[$i]#app:}" "$(section_description "${KI_SECTIONS[$i]}")"
+        i=$((i + 1))
+    done
+    echo
+    if ! ask_yes "Write this configuration?" y; then echo "Nothing was written for $ENV_NAME."; return 1; fi
+
+    mkdir -p "$(dirname "$CONFIG")" 2>/dev/null || die "Cannot create $(dirname "$CONFIG")."
+    [ -f "$CONFIG" ] && cp "$CONFIG" "$CONFIG.bak" && echo "The old configuration is kept as $CONFIG.bak"
+    write_config "$CONFIG" || die "Cannot write $CONFIG."
+    echo "${GREEN}Written: $CONFIG${NC}"
+}
+
+setup_remove() {
+    local envs=() e file
+    for e in $(list_envs); do envs+=("$e"); done
+    choose_one "Which environment shall be removed?" $((${#envs[@]} + 1)) "${envs[@]}" "None"
+    [ "$CHOICE" -le "${#envs[@]}" ] || return
+    e=${envs[$((CHOICE - 1))]}
+    file=$(PROFILE="$e"; CONFIG_FILE=""; find_config)
+    ask_yes "Remove the environment $e ($file)? The cluster itself is not touched." n || return
+    rm -f "$file" "$file.bak" && echo "${GREEN}Removed: $e${NC}"
+}
+
+# the environment that is used when none is named
+setup_default_env() {
+    local envs=() e i=1 current=1 default
+    for e in $(list_envs); do envs+=("$e"); done
+    [ "${#envs[@]}" -gt 0 ] || return
+    default=$(default_env)
+    if [ "${#envs[@]}" -gt 1 ] && [ "$ASSUME_YES" != "yes" ]; then
+        for e in "${envs[@]}"; do [ "$e" = "$default" ] && current=$i; i=$((i + 1)); done
+        choose_one "Which environment shall \"$PROG\" show when you name none?" "$current" "${envs[@]}"
+        default=${envs[$((CHOICE - 1))]}
+    fi
+    mkdir -p "$(user_config_dir)" 2>/dev/null && echo "$default" > "$(user_config_dir)/default"
+}
+
+setup() {
+    local candidate e exists no_more="no" options=() actions=() targets=()
+
+    box "k8s-info Setup" "$(date +'%Y.%m.%d %T')"
+    echo
+    echo "The setup looks at your cluster (it only reads), suggests what the report"
+    echo "shall contain and asks you to confirm. Nothing in the cluster is changed."
+    echo "Each cluster (production, staging, ...) gets its own name and its own setup."
+
+    SETUP_KUBECTL=""
+    for candidate in "kubectl" "oc" "microk8s kubectl" "k3s kubectl"; do
+        if command -v "${candidate%% *}" >/dev/null 2>&1; then SETUP_KUBECTL="$candidate"; break; fi
+    done
+    [ -n "$SETUP_KUBECTL" ] || die "kubectl was not found (also tried: oc, microk8s, k3s). Install it and run the setup again."
+    KI_KUBECTL="$SETUP_KUBECTL"
+
+    exists="new"
+    if [ -n "$CONFIG_FILE" ]; then
+        [ -r "$CONFIG_FILE" ] && exists="change"
+        setup_one "${PROFILE:-custom}" "$exists"
+    elif [ -n "$PROFILE" ]; then
+        env_exists "$PROFILE" && exists="change"
+        setup_one "$PROFILE" "$exists"
+    elif [ -z "$(list_envs)" ]; then
+        setup_one "" "new"
+    elif [ "$ASSUME_YES" = "yes" ]; then
+        if [ -n "$OPT_KUBECONFIG$OPT_CONTEXT" ]; then setup_one "" "new"; else setup_one "$(default_env)" "change"; fi
+    else
+        echo
+        echo "${BOLD}k8s-info is already set up.${NC}"
+        help_envs
+        for e in $(list_envs); do
+            options+=("Change $e - your choices of the last setup are the suggestion"); actions+=("change"); targets+=("$e")
+        done
+        options+=("Add another cluster (for example staging)"); actions+=("new"); targets+=("")
+        options+=("Remove an environment"); actions+=("remove"); targets+=("")
+        options+=("Only choose which environment is used when none is named"); actions+=("default"); targets+=("")
+        options+=("Leave - change nothing"); actions+=("leave"); targets+=("")
+        choose_one "What do you want to do?" 1 "${options[@]}"
+        case "${actions[$((CHOICE - 1))]}" in
+            change|new) setup_one "${targets[$((CHOICE - 1))]}" "${actions[$((CHOICE - 1))]}" ;;
+            remove)     setup_remove; no_more="yes" ;;
+            default)    no_more="yes" ;;
+            leave)      echo "Nothing was changed."; return ;;
+        esac
+    fi
+
+    if [ -n "$CONFIG_FILE" ]; then
+        PROG="$PROG -c $CONFIG_FILE"
+    else
+        while [ "$ASSUME_YES" != "yes" ] && [ "$no_more" != "yes" ] && ask_yes "Set up another cluster now (for example staging)?" n; do
+            OPT_CONTEXT=""; OPT_KUBECONFIG=""
+            setup_one "" "new"
+        done
+        setup_default_env
+        [ -n "$(list_envs)" ] || { echo "No environment is set up."; return; }
+    fi
+
+    step "7. The Command"
+    INSTALLED_NAME=""
+    install_command
+
+    # the last word: how to use it
+    step "Ready - This Is How You Use It"
+    if [ -z "$CONFIG_FILE" ]; then
+        PROFILE=$(default_env)
+        [ -n "$INSTALLED_NAME" ] && PROG="$INSTALLED_NAME"
+    fi
+    CONFIG=$(find_config)
+    config_defaults
+    . "$CONFIG" 2>/dev/null
+    usage
+    [ -z "$CONFIG_FILE" ] && help_envs
+    help_sections
+}
+
+# ======================================================================
+# Main
+# ======================================================================
+
+# the environment: -e, or the first word when it is the name of one
+if [ -z "$PROFILE" ] && [ -z "$CONFIG_FILE" ] && [ "${#POSITIONAL[@]}" -gt 0 ]; then
+    if [ "$MODE" = "setup" ] || env_exists "${POSITIONAL[0]}"; then
+        PROFILE="${POSITIONAL[0]}"
+        POSITIONAL=("${POSITIONAL[@]:1}")
+    fi
+fi
+
+if [ "$MODE" = "setup" ]; then
+    setup
+    exit 0
+fi
+
+[ -z "$PROFILE" ] && [ -z "$CONFIG_FILE" ] && PROFILE=$(default_env)
+CONFIG=$(find_config)
+
+if [ ! -r "$CONFIG" ]; then
+    if [ "$MODE" = "help" ]; then usage; echo; echo "Nothing is set up yet - run: $PROG setup"; exit 0; fi
+    if [ -z "$(list_envs)" ] && [ -z "$CONFIG_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+        echo "Nothing is set up yet."
+        if ask_yes "Start the setup now?" y; then PROFILE=""; setup; exit 0; fi
+    fi
+    die "No configuration found ($CONFIG). Run: $PROG setup"
+fi
+
+config_defaults
+# shellcheck disable=SC1090
+. "$CONFIG" || die "The configuration $CONFIG cannot be read."
+[ -n "$OPT_CONTEXT" ] && KI_CONTEXT="$OPT_CONTEXT"
+
+case "$MODE" in
+    help)   usage; [ -z "$CONFIG_FILE" ] && help_envs; help_sections; exit 0 ;;
+    config) echo "# $CONFIG"; cat "$CONFIG"; exit 0 ;;
+esac
+
+command -v "${KI_KUBECTL%% *}" >/dev/null 2>&1 || die "${KI_KUBECTL%% *} was not found."
+
+# every name is checked before the report starts
+POSITIONS=()
+if [ "${#POSITIONAL[@]}" -eq 0 ] || in_list "all" "${POSITIONAL[@]}"; then
+    i=0
+    while [ "$i" -lt "${#KI_SECTIONS[@]}" ]; do POSITIONS+=("$i"); i=$((i + 1)); done
+else
+    for name in "${POSITIONAL[@]}"; do
+        position=$(section_position "$name") || die "Unknown section: $name (see $PROG --help)"
+        POSITIONS+=("$position")
+    done
+fi
+
+# errors of kubectl belong to the report (also when it is written to a file)
+exec 2>&1
+
+# the environment is named in the box as soon as there is more than one
+LABEL="$(date +'%Y.%m.%d %T')"
+if [ -n "$PROFILE" ] && [ "$(list_envs | grep -c .)" -gt 1 ]; then LABEL="$PROFILE - $LABEL"; fi
+box "$KI_TITLE" "$LABEL"
+for position in "${POSITIONS[@]}"; do
+    run_section "$position"
+done
